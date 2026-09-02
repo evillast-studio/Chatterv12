@@ -1,0 +1,108 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate or restore keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Usando keystore existente desde secrets..."
+            echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          else
+            echo "Generando keystore nuevo..."
+            keytool -genkeypair \
+              -v \
+              -keystore release.keystore \
+              -alias evillastmods \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass evillastmods123 \
+              -keypass evillastmods123 \
+              -dname "CN=EvilLastMods, OU=Android, O=EvilLastMods, L=Unknown, S=Unknown, C=US"
+            echo "========================================"
+            echo "KEYSTORE_BASE64:"
+            base64 release.keystore
+            echo "KEYSTORE_PASSWORD: evillastmods123"
+            echo "KEY_ALIAS: evillastmods"
+            echo "KEY_PASSWORD: evillastmods123"
+            echo "========================================"
+          fi
+
+      - name: Set keystore env for gradle
+        run: |
+          echo "KEYSTORE_FILE=$(pwd)/release.keystore" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD:-evillastmods123}" >> $GITHUB_ENV
+          echo "KEY_ALIAS=${KEY_ALIAS:-evillastmods}" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=${KEY_PASSWORD:-evillastmods123}" >> $GITHUB_ENV
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Expo Prebuild
+        run: npx expo prebuild --platform android --clean
+
+      - name: Patch gradle con firma
+        run: |
+          GRADLE_FILE="android/app/build.gradle"
+          if ! grep -q "signingConfigs" "$GRADLE_FILE"; then
+            sed -i '/^android {/a\    signingConfigs {\n        release {\n            storeFile file(System.getenv("KEYSTORE_FILE"))\n            storePassword System.getenv("KEYSTORE_PASSWORD")\n            keyAlias System.getenv("KEY_ALIAS")\n            keyPassword System.getenv("KEY_PASSWORD")\n        }\n    }' "$GRADLE_FILE"
+          fi
+          sed -i 's/minifyEnabled (findProperty('\''android.enableProguardInReleaseBuilds'\'')/signingConfig signingConfigs.release\n            minifyEnabled (findProperty('\''android.enableProguardInReleaseBuilds'\'')/' "$GRADLE_FILE" 2>/dev/null || true
+
+      - name: Build APK release
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        env:
+          KEYSTORE_FILE: ${{ env.KEYSTORE_FILE }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ env.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+
+      - name: Localizar APK
+        run: |
+          find android -name "*.apk" -not -path "*/intermediates/*" | tee apk_paths.txt
+          APK=$(head -1 apk_paths.txt)
+          echo "APK_PATH=$APK" >> $GITHUB_ENV
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatterUI-EvilLastMods-${{ github.run_number }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
