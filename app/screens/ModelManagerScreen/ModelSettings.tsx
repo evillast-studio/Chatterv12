@@ -140,6 +140,13 @@ const ModelSettings: React.FC<ModelSettingsProp> = ({ modelImporting, modelLoadi
                     />
 
                     <ThemedSwitch
+                        label="Memory Lock (PocketPal)"
+                        value={config.use_mlock ?? false}
+                        onChangeValue={(value) => setConfig({ ...config, use_mlock: value })}
+                        description="Fuerza el modelo en RAM, evita swap (recomendado en Kirin)"
+                    />
+
+                    <ThemedSwitch
                         label="Flash Attention (PocketPal)"
                         value={config.flash_attn ?? false}
                         onChangeValue={(value) => setConfig({ ...config, flash_attn: value })}
