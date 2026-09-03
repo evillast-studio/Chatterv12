@@ -7,6 +7,7 @@ import {
     RNLLAMA_MTMD_DEFAULT_MEDIA_MARKER,
 } from 'cui-llama.rn'
 import { t } from 'i18next'
+import { Platform } from 'react-native'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
@@ -25,7 +26,6 @@ export type CompletionTimings = {
     predicted_per_second: number | null
     predicted_ms: number
     predicted_n: number
-
     prompt_per_token_ms: number
     prompt_per_second: number | null
     prompt_ms: number
@@ -54,7 +54,7 @@ export type LlamaState = {
     completion: (
         params: CompletionParams,
         callback: (text: string) => void,
-        completed: (text: string, timngs: CompletionTimings) => void
+        completed: (text: string, timings: CompletionTimings) => void
     ) => Promise<void>
     stopCompletion: () => Promise<void>
     tokenLength: (text: string, mediaPaths?: string[]) => Promise<number>
@@ -69,12 +69,13 @@ export type LlamaConfig = {
     ubatch: number
     ctx_shift: boolean
     devices: string[]
-    // Optimizaciones de rendimiento (de PocketPal)
-    use_mmap: boolean        // false en Android = repack ON (más rápido en Kirin/ARM)
+    use_mmap: boolean
     use_mlock: boolean
-    flash_attn: boolean      // false en Kirin 710 (sin soporte Vulkan/OpenCL fiable)
-    cache_type_k: string     // 'q8_0' ahorra ~50% VRAM/RAM en caché KV
-    cache_type_v: string     // 'q8_0' ídem
+    flash_attn: boolean
+    kv_unified: boolean
+    cache_type_k: string
+    cache_type_v: string
+    no_extra_bufts: boolean
 }
 
 export type EngineDataProps = {
@@ -89,20 +90,21 @@ export type EngineDataProps = {
 
 const sessionFile = `${AppDirectory.SessionPath}llama-session.bin`
 
-const defaultConfig = {
-    context_length: 2048,   // Kirin 710 tiene ~4GB RAM, 2048 es más seguro que 4096
-    threads: 4,             // 4 cores eficientes en Kirin 710 (A53)
-    gpu_layers: 0,          // GPU Mali-G51 sin soporte llama.cpp confiable en Android
+const defaultConfig: LlamaConfig = {
+    context_length: 2048,
+    threads: 4,
+    gpu_layers: 0,
     batch: 512,
-    ubatch: 512,            // Igual a batch: procesa todo el batch de una vez
+    ubatch: 512,
     ctx_shift: true,
+    use_mmap: false,
+    use_mlock: false,
+    flash_attn: false,
+    kv_unified: true,
+    cache_type_k: 'q8_0',
+    cache_type_v: 'q8_0',
+    no_extra_bufts: false,
     devices: [],
-    // Optimizaciones clave de PocketPal para Android ARM
-    use_mmap: false,        // false + repack ON = más rápido en ARM sin MMU virtual
-    use_mlock: false,       // mlock OFF cuando mmap está OFF (no aplica)
-    flash_attn: false,      // Kirin 710 no tiene Vulkan suficiente para flash attn
-    cache_type_k: 'q8_0',  // Reduce RAM del caché KV a la mitad vs f16
-    cache_type_v: 'q8_0',  // Ídem para caché V
 }
 
 export namespace Llama {
@@ -136,15 +138,27 @@ export namespace Llama {
                     lastMmproj: state.lastMmproj,
                 }),
                 storage: createMMKVStorage(),
-                version: 3,
+                version: 4,
                 migrate: (persistedState: any, version) => {
                     if (version === 1) {
                         persistedState.config.ctx_shift = true
-                        Logger.info('Migrated to v2 EngineData')
+                        Logger.info('Migrated EngineData to v2')
                     }
                     if (version === 2) {
                         persistedState.config.devices = []
-                        Logger.info('Migrated to v3 EngineData')
+                        Logger.info('Migrated EngineData to v3')
+                    }
+                    if (version === 3) {
+                        const c = persistedState.config
+                        if (c.flash_attn === undefined) c.flash_attn = false
+                        if (c.ubatch === undefined) c.ubatch = c.batch ?? 512
+                        if (c.use_mmap === undefined) c.use_mmap = Platform.OS === 'android' ? false : true
+                        if (c.use_mlock === undefined) c.use_mlock = false
+                        if (c.kv_unified === undefined) c.kv_unified = true
+                        if (c.no_extra_bufts === undefined) c.no_extra_bufts = false
+                        if (c.cache_type_k === undefined) c.cache_type_k = 'q8_0'
+                        if (c.cache_type_v === undefined) c.cache_type_v = 'q8_0'
+                        Logger.info('Migrated EngineData to v4 (PocketPal params)')
                     }
                     return persistedState
                 },
@@ -188,19 +202,32 @@ export namespace Llama {
                 n_ctx: config.context_length,
                 n_threads: config.threads,
                 n_batch: config.batch,
-                n_ubatch: config.ubatch,                    // PocketPal: ubatch = batch para máximo throughput
+                n_ubatch: config.ubatch,
                 ctx_shift: config.ctx_shift,
                 n_gpu_layers: config.gpu_layers,
                 use_mlock: config.use_mlock,
-                use_mmap: config.use_mmap,                  // PocketPal: false en Android activa repack (ARM optimizado)
+                use_mmap: config.use_mmap,
                 devices: config.devices,
-                flash_attn: config.flash_attn,              // PocketPal: false en Kirin 710
-                cache_type_k: config.cache_type_k as any,  // PocketPal: q8_0 = mitad de RAM del caché KV
-                cache_type_v: config.cache_type_v as any,  // PocketPal: q8_0 ídem
+                flash_attn: config.flash_attn,
+                // Cache KV cuantizado: funciona con flash_attn OFF
+                cache_type_k: config.cache_type_k as any,
+                cache_type_v: config.cache_type_v as any,
+                // PocketPal v2.0: une buferes KV, ahorra mucha RAM
+                kv_unified: config.kv_unified as any,
+                // PocketPal v2.2: false = repack de pesos ON
+                no_extra_bufts: config.no_extra_bufts as any,
             }
 
             Logger.info(
-                `\n------ MODEL LOAD -----\n Model Name: ${model.name}\nStarting with parameters: \nContext Length: ${params.n_ctx}\nThreads: ${params.n_threads}\nBatch Size: ${params.n_batch}\nuBatch Size: ${params.n_ubatch}\nGPU Layers: ${params.n_gpu_layers}\nuse_mmap: ${params.use_mmap}\nflash_attn: ${params.flash_attn}\ncache_type_k: ${params.cache_type_k}\ncache_type_v: ${params.cache_type_v}`
+                `\n------ MODEL LOAD -----\n` +
+                `Model: ${model.name}\n` +
+                `Context: ${params.n_ctx} | Threads: ${params.n_threads}\n` +
+                `Batch: ${params.n_batch} | uBatch: ${params.n_ubatch}\n` +
+                `GPU Layers: ${params.n_gpu_layers}\n` +
+                `use_mmap: ${params.use_mmap} | use_mlock: ${params.use_mlock}\n` +
+                `flash_attn: ${params.flash_attn} | kv_unified: ${params.kv_unified}\n` +
+                `cache_type_k: ${params.cache_type_k} | cache_type_v: ${params.cache_type_v}\n` +
+                `no_extra_bufts: ${params.no_extra_bufts}`
             )
 
             const progressCallback = (progress: number) => {
@@ -222,7 +249,6 @@ export namespace Llama {
                 chatCount: 1,
             })
 
-            // updated EngineData
             useLlamaPreferencesStore.getState().setLastModelLoaded(model)
             KV.useKVStore.getState().setKvCacheLoaded(false)
         },
@@ -240,7 +266,6 @@ export namespace Llama {
                 if (model.file_path.includes('content://')) {
                     closeFd(model_path)
                 }
-
                 Logger.errorToast(t('model.toast.failedToLoadMMPROJ'), JSON.stringify(e))
             })
             if (await context.isMultimodalEnabled()) {
@@ -250,10 +275,7 @@ export namespace Llama {
                 )
             }
 
-            set({
-                mmproj: model,
-            })
-
+            set({ mmproj: model })
             useLlamaPreferencesStore.getState().setLastMmprojLoaded(model)
         },
         setLoadProgress: (progress: number) => {
@@ -263,13 +285,8 @@ export namespace Llama {
             if (get().mmproj) {
                 await get().context?.releaseMultimodal()
             }
-
             await get().context?.release()
-            set({
-                context: undefined,
-                model: undefined,
-                mmproj: undefined,
-            })
+            set({ context: undefined, model: undefined, mmproj: undefined })
             Logger.info('Model Unloaded')
         },
         unloadMmproj: async () => {
@@ -279,9 +296,7 @@ export namespace Llama {
                 .catch((e) => {
                     Logger.errorToast(t('model.toast.failedToUnloadMMPROJ'), JSON.stringify(e))
                 })
-            set({
-                mmproj: undefined,
-            })
+            set({ mmproj: undefined })
         },
         completion: async (
             params: CompletionParams,
@@ -398,4 +413,4 @@ export namespace Llama {
                 : '\nNo Tokens Generated')
         )
     }
-}
+    }
