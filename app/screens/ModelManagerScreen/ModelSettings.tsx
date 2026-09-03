@@ -143,7 +143,7 @@ const ModelSettings: React.FC<ModelSettingsProp> = ({ modelImporting, modelLoadi
                         label="Memory Lock (PocketPal)"
                         value={config.use_mlock ?? false}
                         onChangeValue={(value) => setConfig({ ...config, use_mlock: value })}
-                        description="Fuerza el modelo en RAM, evita swap (recomendado en Kirin)"
+                        description="Fuerza el modelo en RAM, evita swap. Dejar OFF cuando use_mmap está OFF"
                     />
 
                     <ThemedSwitch
@@ -151,6 +151,20 @@ const ModelSettings: React.FC<ModelSettingsProp> = ({ modelImporting, modelLoadi
                         value={config.flash_attn ?? false}
                         onChangeValue={(value) => setConfig({ ...config, flash_attn: value })}
                         description="Desactivar en Kirin 710 (Mali-G51 no lo soporta bien)"
+                    />
+
+                    <ThemedSwitch
+                        label="KV Unificado (PocketPal)"
+                        value={config.kv_unified ?? true}
+                        onChangeValue={(value) => setConfig({ ...config, kv_unified: value })}
+                        description="Une búferes KV en uno solo — ahorra RAM significativa. Mantener ON"
+                    />
+
+                    <ThemedSwitch
+                        label="Repack pesos (PocketPal)"
+                        value={!(config.no_extra_bufts ?? false)}
+                        onChangeValue={(value) => setConfig({ ...config, no_extra_bufts: !value })}
+                        description="Reempaqueta pesos para ARM — más rápido con use_mmap OFF. Mantener ON"
                     />
 
                     <HorizontalSelector
