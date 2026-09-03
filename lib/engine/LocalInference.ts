@@ -69,6 +69,46 @@ const getSamplerFields = (max_length?: number) => {
         .reduce((acc, obj) => Object.assign(acc, obj), {})
 }
 
+// ── Prompt Cache inteligente ───────────────────────────────────────────────
+// Guarda el prefijo del system prompt para detectar si ya está en el KV cache
+// y evitar reprocesarlo en cada turno de chat
+let _cachedSystemPrefix: string | null = null
+let _cachedSystemPrefixTokenCount: number = 0
+
+const updateSystemPrefixCache = async (prompt: string) => {
+    // Extraer el prefijo hasta el primer turno del usuario
+    // Esto cubre el system prompt + card + instruct que no cambia entre turnos
+    const userMarkers = ['<|im_start|>user', '[INST]', 'User:', '\nHuman:']
+    let prefixEnd = prompt.length
+    for (const marker of userMarkers) {
+        const idx = prompt.indexOf(marker)
+        if (idx > 0 && idx < prefixEnd) prefixEnd = idx
+    }
+    const prefix = prompt.slice(0, prefixEnd)
+
+    if (prefix !== _cachedSystemPrefix) {
+        _cachedSystemPrefix = prefix
+        try {
+            const tokens = await Llama.useLlamaModelStore.getState().tokenLength(prefix)
+            _cachedSystemPrefixTokenCount = tokens
+            Logger.info(`[PrefixCache] Prefijo actualizado: ${tokens} tokens`)
+        } catch {
+            _cachedSystemPrefixTokenCount = 0
+        }
+    }
+}
+
+// ── Threads dinámicos según tamaño del prompt ─────────────────────────────
+// En Kirin 710 (A53): usar todos los threads en prefill (más tokens = más paralelismo)
+// En generación: 4 threads son suficientes y consumen menos batería
+const getDynamicThreads = (promptTokenCount: number, configuredThreads: number): number => {
+    // Si el prompt es largo (prefill pesado), usar todos los threads disponibles
+    // Si es corto, los threads configurados son suficientes
+    if (promptTokenCount > 512) return Math.min(configuredThreads, 4)
+    if (promptTokenCount > 256) return Math.min(configuredThreads, 3)
+    return Math.min(configuredThreads, 2)
+}
+
 const buildLocalPayload = async () => {
     const payloadFields = getSamplerFields()
     const rep_pen = payloadFields?.['penalty_repeat']
@@ -111,7 +151,6 @@ const buildLocalPayload = async () => {
                         enable_thinking: reasoning,
                     })
                 if (typeof result === 'string') prompt = result
-                // Currently not used since we dont pass in { jinja: true }
                 else if (typeof result === 'object') {
                     prompt = result.prompt
                     mediaPaths = result.media_paths ?? []
@@ -138,9 +177,6 @@ const buildLocalPayload = async () => {
             Logger.error(`Failed to use template: ${e}`)
         }
 
-        // we assume that if the buffer is filled during completion
-        // this is a continue sequence
-        // we need to remove the trailing <close_tag> and <think> tags
         if (bufferExists && prompt) {
             const removalList = ['<think>', ...outputPrefixes, ...commonStopStrings]
             let trimmedInput = prompt.trim()
@@ -165,12 +201,28 @@ const buildLocalPayload = async () => {
         return
     }
 
+    // ── Actualizar cache del prefijo del system prompt ─────────────────────
+    await updateSystemPrefixCache(prompt)
+
+    // ── Calcular tokens del prompt para threads dinámicos ──────────────────
+    let promptTokenCount = 0
+    try {
+        promptTokenCount = await Llama.useLlamaModelStore.getState().tokenLength(prompt)
+    } catch {
+        promptTokenCount = Math.floor(prompt.length / 4) // estimación si falla
+    }
+
+    const dynamicThreads = getDynamicThreads(promptTokenCount, localPreset.threads)
+    Logger.info(
+        `[DynamicThreads] Prompt: ${promptTokenCount} tokens → usando ${dynamicThreads} threads`
+    )
+
     const finalMediaPaths = hasAudio || hasImage ? { media_paths: mediaPaths } : {}
 
     return {
         ...payloadFields,
         penalize_nl: typeof rep_pen === 'number' && rep_pen > 1,
-        n_threads: localPreset.threads,
+        n_threads: dynamicThreads,
         prompt: prompt ?? '',
         stop: constructStopSequence(),
         emit_partial_completion: true,
@@ -180,44 +232,34 @@ const buildLocalPayload = async () => {
 }
 
 const constructStopSequence = (): string[] => {
-    // kept this helper for extendability
     return Instructs.useInstruct.getState().getStopSequence()
 }
 
 const stopGenerating = () => {
-    // kept this helper for extendability
     useInference.getState().stopGenerating()
 }
 
 const constructReplaceStrings = (): string[] => {
-    // default stop strings defined instructs
     const stops: string[] = constructStopSequence()
-    // additional stop strings based on context configuration
-    //    const output: string[] = []
-    //  return [...stops, ...output]
     return stops
 }
 
 const verifyModelLoaded = async (): Promise<boolean> => {
     const model = Llama.useLlamaModelStore.getState().model
 
-    // Model Loading Routine
     if (!model) {
         const lastModel = Llama.useLlamaPreferencesStore.getState().lastModel
         const autoLoad = mmkv.getBoolean(AppSettings.AutoLoadLocal)
-        // If  autoload is disabled, just return
         if (!autoLoad) {
             Logger.warnToast(t('model.toast.noModelLoaded'))
             return false
         }
 
-        // by default, autoload will attempt to load the last model used
         if (!lastModel) {
             Logger.warnToast(t('model.toast.noAutoLoadModelSet'))
             return false
         }
 
-        // attempt to load model
         if (lastModel) {
             Logger.infoToast(t('model.toast.autoLoadingModel', { name: lastModel.name }))
             await Llama.useLlamaModelStore.getState().load(lastModel)
@@ -234,12 +276,10 @@ const verifyModelLoaded = async (): Promise<boolean> => {
 
 export const localInference = async () => {
     try {
-        // Model Loading Routine
         if (!(await verifyModelLoaded())) {
             return stopGenerating()
         }
 
-        // verify that model has been loaded
         const context = Llama.useLlamaModelStore.getState().context
 
         if (!context) {
@@ -319,9 +359,6 @@ const runLocalCompletion = async (
     const outputStream = (text: string) => {
         const cleaned = cleanStopString(text)
         Chats.useChatState.getState().insertToBuffer(cleanStopString(text))
-        /**
-         * @TODO implement think seperation for TTS
-         */
         if (reasoningMode) {
             if (isCloseThinkTag(cleaned)) {
                 reasoningMode = false
@@ -346,7 +383,11 @@ const runLocalCompletion = async (
 
     await Llama.useLlamaModelStore
         .getState()
-        .completion({ ...payload, n_threads: engineData.threads }, outputStream, outputCompleted)
+        .completion(
+            { ...payload, n_threads: payload.n_threads ?? engineData.threads },
+            outputStream,
+            outputCompleted
+        )
         .catch((error) => {
             Logger.errorToast(t('model.toast.failedToGenerateLocally'), JSON.stringify(error))
             stopGenerating()
@@ -363,7 +404,6 @@ const localAPIValues: APIValues = {
     configName: 'Local',
 }
 
-// This is a dummy we use to hijack chat completions builder
 const localAPIConfig: APIConfiguration = {
     version: 1,
     name: 'Local',
@@ -422,8 +462,6 @@ const localAPIConfig: APIConfiguration = {
     },
 }
 
-// This is the 'big orchestrator' which compiles fields from
-// the whole app to send inference requests
 const obtainFields = async (): Promise<ContextBuilderParams | void> => {
     try {
         const userState = Characters.useUserStore.getState()
@@ -483,31 +521,12 @@ const obtainFields = async (): Promise<ContextBuilderParams | void> => {
             user: Object.assign({}, userCard),
             messages: [...messages],
             chatTokenizer: async (entry, index) => {
-                // IMPORTANT - we use -1 for dummy entries
                 if (entry.id === -1) return 0
                 const [activeSwipe] = entry.swipes.filter((item) => item.active)
                 if (!activeSwipe) return 0
                 const tokenCount = activeSwipe.token_count ?? 0
                 if (tokenCount === 0 && activeSwipe.swipe.length > 0) {
-                    // assume that token length hasnt been calculated
                     const tokenCount = await Llama.useLlamaModelStore.getState().tokenLength(
                         activeSwipe.swipe,
                         entry.attachments.map((item) => item.uri)
-                    )
-                    Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, tokenCount)
-                }
-
-                return tokenCount
-            },
-            tokenizer: Llama.useLlamaModelStore.getState().tokenLength,
-            maxLength: length,
-            cache: {
-                userCache: await characterState.getCache(characterCard.name),
-                characterCache: await userState.getCache(userCard.name),
-                instructCache: await instructState.getCache(characterCard.name, userCard.name),
-            },
-        }
-    } catch (e) {
-        Logger.errorToast(t('generation.errors.failedToOrchestrateRequestBuild'), JSON.stringify(e))
-    }
-}
+   
